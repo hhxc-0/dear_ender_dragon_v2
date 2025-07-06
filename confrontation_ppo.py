@@ -147,7 +147,7 @@ class Agent(nn.Module):
         self.actor_main_head = nn.Sequential(
             layer_init(nn.Linear(64, 64)),
             nn.ReLU(),
-            layer_init(nn.Linear(64, envs.single_action_space["main_head"].n), std=0.01),
+            layer_init(nn.Linear(64, envs.single_action_space["main_head"].n * 2 + 1), std=0.01),  # *2 for camera option and +1 for inventory
         )
         self.actor_camera_head = nn.Sequential(
             layer_init(nn.Linear(64, 64)),
@@ -158,43 +158,36 @@ class Agent(nn.Module):
     def get_value(self, x):
         return self.critic(x)
 
-    def get_action_and_value(self, x, action=None):  # TODO: Split log_prob and entropy calculation for learning phase into another function, and having raw values for the heads stored for learning instead of action
+    def get_logits(self, x):
         main_features = self.actor_main(x)
         main_head_logits = self.actor_main_head(main_features)
         camera_head_logits = self.actor_camera_head(main_features)
+        return main_head_logits, camera_head_logits
+
+    def get_action_and_value(self, x):
+        main_head_logits, camera_head_logits = self.get_logits(x)
         main_head_dist = Categorical(logits=main_head_logits)
         camera_head_dist = Categorical(logits=camera_head_logits)
-        log_prob = torch.zeros(x.shape[0], dtype=torch.float32)
-        entropy = torch.zeros(x.shape[0], dtype=torch.float32)
-        if action is None:
-            action = {
-                "main_head": torch.zeros(x.shape[0], dtype=torch.int32),
-                "inventory": torch.zeros(x.shape[0], dtype=torch.bool),
-                "camera_enabled": torch.zeros(x.shape[0], dtype=torch.bool),
-                "camera_head": torch.zeros(x.shape[0], dtype=torch.int8),
-            }
-            main_head_actions = main_head_dist.sample()
-            camera_head_actions = camera_head_dist.sample()
-            main_head_log_probs = main_head_dist.log_prob(main_head_actions)
-            camera_head_log_probs = camera_head_dist.log_prob(camera_head_actions)
-            main_head_entropies = main_head_dist.entropy()
-            camera_head_entropies = camera_head_dist.entropy()
-            action["inventory"] = main_head_actions == 0
-            action["camera_head"] = camera_head_actions
-            action["camera_enabled"] = action["inventory"].logical_not() * ((main_head_actions - 1) % 2 == 1)
-            action["main_head"] = (main_head_actions - action["inventory"].logical_not().int()) // 2  # remove the inventory offset and the camera choice
-            log_prob = main_head_log_probs + action["camera_enabled"] * camera_head_log_probs
-            entropy = main_head_entropies + action["camera_enabled"] * camera_head_entropies
-        else:
-            main_head_log_probs = main_head_dist.log_prob((action["main_head"] * 2 + action["camera_enabled"] + 1) * action["inventory"].logical_not())  # restore the camera choice and inventory offset
-            camera_head_log_probs = camera_head_dist.log_prob(action["camera_head"])
-            main_head_entropies = main_head_dist.entropy()
-            camera_head_entropies = camera_head_dist.entropy()
-            camera_head_mask = action["camera_enabled"] * action["inventory"].logical_not()
-            log_prob = main_head_log_probs + camera_head_mask * camera_head_log_probs
-            entropy = main_head_entropies + camera_head_mask * camera_head_entropies
-        return action, log_prob, entropy, self.critic(x)
+        action = {}
+        main_head_action = main_head_dist.sample()
+        camera_head_action = camera_head_dist.sample()
+        main_head_log_prob = main_head_dist.log_prob(main_head_action)
+        camera_head_log_prob = camera_head_dist.log_prob(camera_head_action)
+        action["inventory"] = torch.tensor(main_head_action == 0, dtype=torch.bool)
+        action["camera_head"] = torch.tensor(camera_head_action, dtype=torch.int8)
+        action["camera_enabled"] = torch.tensor(action["inventory"].logical_not() * ((main_head_action - 1) % 2 == 1), dtype=torch.bool)
+        action["main_head"] = torch.tensor((main_head_action - action["inventory"].logical_not().int()) // 2, dtype=torch.int32)  # remove the inventory offset and the camera choice
+        return action, self.critic(x), main_head_log_prob, camera_head_log_prob, main_head_action, camera_head_action
 
+    def get_log_prob_and_entropy(self, x, main_head_actions, camera_head_actions):
+        main_head_logits, camera_head_logits = self.get_logits(x)
+        main_head_dist = Categorical(logits=main_head_logits)
+        camera_head_dist = Categorical(logits=camera_head_logits)
+        main_head_log_prob = main_head_dist.log_prob(main_head_actions)
+        camera_head_log_prob = camera_head_dist.log_prob(camera_head_actions)
+        main_head_entropy = main_head_dist.entropy()
+        camera_head_entropy = camera_head_dist.entropy()
+        return main_head_log_prob, main_head_entropy, camera_head_log_prob, camera_head_entropy, self.critic(x)
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
@@ -238,21 +231,11 @@ if __name__ == "__main__":
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = {
-        "main_head": torch.zeros(
-            (args.num_steps, args.num_envs) + envs.single_action_space["main_head"].shape, dtype=torch.int32
-        ).to(device),
-        "inventory": torch.zeros(
-            (args.num_steps, args.num_envs), dtype=torch.bool
-        ).to(device),
-        "camera_enabled": torch.zeros(
-            (args.num_steps, args.num_envs), dtype=torch.bool
-        ).to(device),
-        "camera_head": torch.zeros(
-            (args.num_steps, args.num_envs) + envs.single_action_space["camera_head"].shape, dtype=torch.int8
-        ).to(device),
-    }
-    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    main_head_actions = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    camera_head_actions = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    main_head_log_probs = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    camera_head_log_probs = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    camera_head_masks = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -278,11 +261,13 @@ if __name__ == "__main__":
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                action, value, main_head_action, camera_head_action, main_head_log_prob, camera_head_log_prob = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
-            for key in action.keys():
-                actions[key][step] = action[key]
-            logprobs[step] = logprob
+            main_head_actions[step] = main_head_action
+            camera_head_actions[step] = camera_head_action
+            main_head_log_probs[step] = main_head_log_prob
+            camera_head_log_probs[step] = camera_head_log_prob
+            camera_head_masks[step] = action["camera_enabled"]
 
             # TRY NOT TO MODIFY: execute the game and log data.
             next_obs, reward, next_done, infos = envs.step({key: action[key].cpu().numpy() for key in action.keys()})
@@ -315,8 +300,11 @@ if __name__ == "__main__":
 
         # flatten the batch
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
-        b_logprobs = logprobs.reshape(-1)
-        b_actions = {key: actions[key].reshape((-1,) + envs.single_action_space[key].shape) for key in actions.keys()}
+        b_main_head_log_probs = main_head_log_probs.reshape(-1)
+        b_camera_head_log_probs = camera_head_log_probs.reshape(-1)
+        b_main_head_actions = main_head_actions.reshape(-1)
+        b_camera_head_actions = camera_head_actions.reshape(-1)
+        b_camera_head_masks = camera_head_masks.reshape(-1)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
@@ -335,10 +323,11 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
-                    b_obs[mb_inds], {key: b_actions[key][mb_inds] for key in b_actions.keys()}
+                new_main_head_log_prob, main_head_entropy, new_camera_head_log_prob, camera_head_entropy, newvalue = agent.get_log_prob_and_entropy(
+                    b_obs[mb_inds], b_main_head_log_probs[mb_inds], b_camera_head_log_probs[mb_inds]
                 )
-                logratio = newlogprob.to(device) - b_logprobs[mb_inds]
+                logratio = new_main_head_log_prob.to(device) - b_main_head_log_probs[mb_inds] + b_camera_head_masks[mb_inds] * (new_camera_head_log_prob.to(device) - b_camera_head_log_probs[mb_inds])
+                entropy = main_head_entropy.to(device) + b_camera_head_masks[mb_inds] * camera_head_entropy.to(device)
                 ratio = logratio.exp()
 
                 with torch.no_grad():
