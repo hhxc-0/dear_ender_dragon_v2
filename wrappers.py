@@ -1,20 +1,28 @@
 import numpy as np
 import copy
 from gym import spaces, Wrapper
+from gym.spaces import Box
 
 
 class CustomObservationSpace(Wrapper):
     def __init__(self, env):
         super().__init__(env)
-        self.observation_space = self.observation_space["pov"]
+        self.observation_space = Box(
+            low=0, high=1, shape=(3, env.observation_space["pov"].shape[0], env.observation_space["pov"].shape[1])
+        )
+
+    def _process_obs(self, obs):
+        obs = obs["pov"] / 255.0  # normalize the observation to be between 0 and 1
+        obs = np.transpose(obs, (2, 0, 1))  # (H, W, C) -> (C, H, W)
+        return obs
 
     def reset(self, *args, **kwargs):
         obs = super().reset(*args, **kwargs)
-        return obs["pov"]
+        return self._process_obs(obs)
 
     def step(self, action):
         obs, reward, done, info = super().step(action)
-        return obs["pov"], reward, done, info
+        return self._process_obs(obs), reward, done, info
 
 
 class CustomActionSpace(Wrapper):
@@ -31,8 +39,8 @@ class CustomActionSpace(Wrapper):
             ["drop"],
             ["attack"],
             ["jump"],
-            ["pickItem"],
-            ["swapHand"],
+            # ["pickItem"],
+            # ["swapHand"],
         ]
 
         # create action templates
@@ -50,26 +58,23 @@ class CustomActionSpace(Wrapper):
 
         self.action_space = spaces.Dict(
             {
-                "main_head": spaces.Discrete(34561),
-                # 3^3 × 10 × 2^6 × 2 + 1 = 34561
-                # 3^3 for the 3 sets of 2 mutually exclusive keys above where taking neither in the set is an option
-                # 10 for the 9 hotbar keys or no hotbar keypress
-                # 2^4 for the remaining binary 4 keys: use, drop, attack, and jump
-                # 2 for whether or not to move the mouse(camera)
-                # +1 for the inventory button which is mutually exclusive with all other actions
-                "camera_head": spaces.Discrete(121),
-                # 11^2 camera movements, only enabled when the camera is enabled in the main_head
+                "main_head": spaces.Discrete(
+                    np.prod([len(group) + 1 for group in self.action_groups])
+                ),  # product of the number of actions in each group
+                "inventory": spaces.Discrete(2),
+                "camera_enabled": spaces.Discrete(2),
+                "camera_head": spaces.Discrete(
+                    self.n_camera_bins**2
+                ),  # n_camera_bins^2 camera movements, only enabled when the camera is enabled in the main_head
             }
         )
 
-    def step(self, action):
-        main_head = action["main_head"]
-        camera_head = action["camera_head"]
-        if main_head == 0:  # if inventory is selected, return the inventory only action
-            print("inventory")
+    def step(self, original_action):
+        main_head = original_action["main_head"]
+        camera_head = original_action["camera_head"]
+        if original_action["inventory"] == True:  # if inventory is selected, return the inventory only action
             return super().step(self.inventory_only_action)
         else:
-            main_head -= 1  # remove the inventory offset
             action = self.no_action.copy()
             for group in self.action_groups:
                 n_choices = len(group) + 1  # +1 for the no action option
@@ -77,9 +82,20 @@ class CustomActionSpace(Wrapper):
                 main_head //= n_choices
                 if selection != 0:
                     action[group[selection - 1]] = 1
-            if main_head == 0:
+
+            if original_action["camera_enabled"] == True:
                 camera_bin_x = camera_head // self.n_camera_bins
                 camera_bin_y = camera_head % self.n_camera_bins
                 action["camera"] = (self.camera_mapping[camera_bin_x], self.camera_mapping[camera_bin_y])
-            print(action)
             return super().step(action)
+
+class RenderWrapper(Wrapper):
+    def __init__(self, env, render_mode="human"):
+        super().__init__(env)
+        self.env = env
+        self.render_mode = render_mode
+        
+    def step(self, action):
+        obs, reward, done, info = super().step(action)
+        self.env.render(mode=self.render_mode)
+        return obs, reward, done, info

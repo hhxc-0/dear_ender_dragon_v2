@@ -46,9 +46,9 @@ while not done:
     obs, reward, done, _ = env.step(action)
     env.render()
     step_count += 1
-    print(f"Action: {action}")
-    print(f"Step count: {step_count}")
-    print(f"Done: {done}")
+    # print(f"Action: {action}")
+    # print(f"Step count: {step_count}")
+    # print(f"Done: {done}")
 
 # %%
 env.close()

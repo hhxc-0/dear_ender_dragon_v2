@@ -15,6 +15,8 @@ import tyro
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
+from wrappers import CustomObservationSpace, CustomActionSpace, RenderWrapper
+
 
 @dataclass
 class Args:
@@ -42,7 +44,7 @@ class Args:
     """total timesteps of the experiments"""
     learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 1
+    num_envs: int = 2
     """the number of parallel game environments"""
     num_steps: int = 128
     """the number of steps to run in each environment per policy rollout"""
@@ -85,7 +87,10 @@ def make_env(env_id, idx, capture_video, run_name):
         env = gym.make(env_id)
         if capture_video and idx == 0:
             env = gym.wrappers.record_video.RecordVideo(env, f"videos/{run_name}")
+            env = RenderWrapper(env)
         env = gym.wrappers.record_episode_statistics.RecordEpisodeStatistics(env)
+        env = CustomObservationSpace(env)
+        env = CustomActionSpace(env)
         return env
 
     return thunk
@@ -101,29 +106,94 @@ class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
+            layer_init(nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1)),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1)),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.ReLU(),
+            nn.Flatten(),
+            layer_init(
+                nn.Linear(
+                    32 * envs.single_observation_space.shape[1] * envs.single_observation_space.shape[2] // 4**3, 64
+                )
+            ),
+            nn.ReLU(),
             layer_init(nn.Linear(64, 1), std=1.0),
         )
-        self.actor = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
-            nn.Tanh(),
+        self.actor_main = nn.Sequential(
+            layer_init(nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1)),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1)),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1)),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.ReLU(),
+            nn.Flatten(),
+            layer_init(
+                nn.Linear(
+                    32 * envs.single_observation_space.shape[1] * envs.single_observation_space.shape[2] // 4**3, 64
+                )
+            ),
+            nn.ReLU(),
             layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01),
+            nn.ReLU(),
+        )
+        self.actor_main_head = nn.Sequential(
+            layer_init(nn.Linear(64, 64)),
+            nn.ReLU(),
+            layer_init(nn.Linear(64, envs.single_action_space["main_head"].n), std=0.01),
+        )
+        self.actor_camera_head = nn.Sequential(
+            layer_init(nn.Linear(64, 64)),
+            nn.ReLU(),
+            layer_init(nn.Linear(64, envs.single_action_space["camera_head"].n), std=0.01),
         )
 
     def get_value(self, x):
         return self.critic(x)
 
-    def get_action_and_value(self, x, action=None):
-        logits = self.actor(x)
-        probs = Categorical(logits=logits)
+    def get_action_and_value(self, x, action=None):  # TODO: Split log_prob and entropy calculation for learning phase into another function, and having raw values for the heads stored for learning instead of action
+        main_features = self.actor_main(x)
+        main_head_logits = self.actor_main_head(main_features)
+        camera_head_logits = self.actor_camera_head(main_features)
+        main_head_dist = Categorical(logits=main_head_logits)
+        camera_head_dist = Categorical(logits=camera_head_logits)
+        log_prob = torch.zeros(x.shape[0], dtype=torch.float32)
+        entropy = torch.zeros(x.shape[0], dtype=torch.float32)
         if action is None:
-            action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(x)
+            action = {
+                "main_head": torch.zeros(x.shape[0], dtype=torch.int32),
+                "inventory": torch.zeros(x.shape[0], dtype=torch.bool),
+                "camera_enabled": torch.zeros(x.shape[0], dtype=torch.bool),
+                "camera_head": torch.zeros(x.shape[0], dtype=torch.int8),
+            }
+            main_head_actions = main_head_dist.sample()
+            camera_head_actions = camera_head_dist.sample()
+            main_head_log_probs = main_head_dist.log_prob(main_head_actions)
+            camera_head_log_probs = camera_head_dist.log_prob(camera_head_actions)
+            main_head_entropies = main_head_dist.entropy()
+            camera_head_entropies = camera_head_dist.entropy()
+            action["inventory"] = main_head_actions == 0
+            action["camera_head"] = camera_head_actions
+            action["camera_enabled"] = action["inventory"].logical_not() * ((main_head_actions - 1) % 2 == 1)
+            action["main_head"] = (main_head_actions - action["inventory"].logical_not().int()) // 2  # remove the inventory offset and the camera choice
+            log_prob = main_head_log_probs + action["camera_enabled"] * camera_head_log_probs
+            entropy = main_head_entropies + action["camera_enabled"] * camera_head_entropies
+        else:
+            main_head_log_probs = main_head_dist.log_prob((action["main_head"] * 2 + action["camera_enabled"] + 1) * action["inventory"].logical_not())  # restore the camera choice and inventory offset
+            camera_head_log_probs = camera_head_dist.log_prob(action["camera_head"])
+            main_head_entropies = main_head_dist.entropy()
+            camera_head_entropies = camera_head_dist.entropy()
+            camera_head_mask = action["camera_enabled"] * action["inventory"].logical_not()
+            log_prob = main_head_log_probs + camera_head_mask * camera_head_log_probs
+            entropy = main_head_entropies + camera_head_mask * camera_head_entropies
+        return action, log_prob, entropy, self.critic(x)
 
 
 if __name__ == "__main__":
@@ -162,16 +232,26 @@ if __name__ == "__main__":
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
     )
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
-    assert envs.single_observation_space.shape is not None
-    assert envs.single_action_space.shape is not None
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
+    actions = {
+        "main_head": torch.zeros(
+            (args.num_steps, args.num_envs) + envs.single_action_space["main_head"].shape, dtype=torch.int32
+        ).to(device),
+        "inventory": torch.zeros(
+            (args.num_steps, args.num_envs), dtype=torch.bool
+        ).to(device),
+        "camera_enabled": torch.zeros(
+            (args.num_steps, args.num_envs), dtype=torch.bool
+        ).to(device),
+        "camera_head": torch.zeros(
+            (args.num_steps, args.num_envs) + envs.single_action_space["camera_head"].shape, dtype=torch.int8
+        ).to(device),
+    }
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -180,7 +260,7 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
-    next_obs, _ = envs.reset(seed=args.seed)
+    next_obs = envs.reset()
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
 
@@ -200,12 +280,12 @@ if __name__ == "__main__":
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
-            actions[step] = action
+            for key in action.keys():
+                actions[key][step] = action[key]
             logprobs[step] = logprob
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, dones, infos = envs.step(action.cpu().numpy())
-            next_done = dones
+            next_obs, reward, next_done, infos = envs.step({key: action[key].cpu().numpy() for key in action.keys()})
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
@@ -234,11 +314,9 @@ if __name__ == "__main__":
             returns = advantages + values
 
         # flatten the batch
-        assert envs.single_observation_space.shape is not None
-        assert envs.single_action_space.shape is not None
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+        b_actions = {key: actions[key].reshape((-1,) + envs.single_action_space[key].shape) for key in actions.keys()}
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
@@ -257,8 +335,10 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
-                logratio = newlogprob - b_logprobs[mb_inds]
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
+                    b_obs[mb_inds], {key: b_actions[key][mb_inds] for key in b_actions.keys()}
+                )
+                logratio = newlogprob.to(device) - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
                 with torch.no_grad():
