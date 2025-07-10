@@ -1,6 +1,7 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppopy
 import os
 import random
+from re import T
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -34,11 +35,14 @@ class Args:
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
-    capture_video: bool = True
+    capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
+    render: bool = True
+    """whether to render the environment"""
 
     # Algorithm specific arguments
     env_id: str = "MineRLObtainDiamondShovel-v0"
+    # env_id: str = "MineRLNavigateDense-v0"
     """the id of the environment"""
     total_timesteps: int = 500000
     """total timesteps of the experiments"""
@@ -82,11 +86,12 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 
-def make_env(env_id, idx, capture_video, run_name):
+def make_env(env_id, idx, capture_video, render, run_name):
     def thunk():
         env = gym.make(env_id)
         if capture_video and idx == 0:
             env = gym.wrappers.record_video.RecordVideo(env, f"videos/{run_name}")
+        if render and idx == 0:
             env = RenderWrapper(env)
         env = gym.wrappers.record_episode_statistics.RecordEpisodeStatistics(env)
         env = CustomObservationSpace(env)
@@ -223,7 +228,7 @@ if __name__ == "__main__":
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name) for i in range(args.num_envs)],
+        [make_env(args.env_id, i, args.capture_video, args.render, run_name) for i in range(args.num_envs)],
     )
 
     agent = Agent(envs).to(device)

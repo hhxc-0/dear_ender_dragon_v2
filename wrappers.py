@@ -34,7 +34,7 @@ class CustomActionSpace(Wrapper):
             ["forward", "back"],
             ["left", "right"],
             ["sneak", "sprint"],
-            [f"hotbar.{i}" for i in range(9)],
+            [f"hotbar.{i}" for i in range(1, 10)],
             ["use"],
             ["drop"],
             ["attack"],
