@@ -279,10 +279,10 @@ if __name__ == "__main__":
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
-            if "episode" in infos and "_episode" in infos:
-                for env_index in np.nonzero(infos["_episode"])[0]:
-                    episodic_return = infos['episode']['r'][env_index]
-                    episodic_length = infos["episode"]["l"][env_index]
+            for info in infos:
+                if "episode" in info:
+                    episodic_return = info['episode']['r']
+                    episodic_length = info["episode"]["l"]
                     print(f"global_step={global_step}, episodic_return={episodic_return}")
                     writer.add_scalar("charts/episodic_return", episodic_return, global_step)
                     writer.add_scalar("charts/episodic_length", episodic_length, global_step)
